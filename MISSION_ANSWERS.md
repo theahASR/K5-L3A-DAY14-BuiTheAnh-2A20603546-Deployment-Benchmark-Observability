@@ -127,7 +127,231 @@ Bản develop chứng minh agent chạy được trên laptop, nhưng chưa prod
 
 ## Part 2 — Docker
 
-<!-- Điền sau khi hoàn thành CP2: 4 câu hỏi Dockerfile, kết quả gọi container, size 2 image + %, sơ đồ stack, test Nginx. -->
+### Exercise 2.1 — Dockerfile cơ bản
+
+Đọc `02-docker/develop/Dockerfile` và trả lời:
+
+1. **Base image là gì?**  
+   `python:3.11` — bản Python đầy đủ (không phải slim/alpine), nên image khá lớn.
+
+2. **Working directory là gì?**  
+   `/app` (dòng 11: `WORKDIR /app`).
+
+3. **Tại sao `COPY requirements.txt` phải đứng trước `COPY . .`?**  
+   Docker build theo từng layer và dùng cache. Khi `requirements.txt` không đổi, layer `pip install` được lấy từ cache; chỉ khi requirements thay đổi mới phải cài lại. Nếu copy toàn bộ source trước, mỗi lần sửa một dòng code sẽ làm mất cache dependencies và build lại từ đầu.
+
+4. **`CMD` vs `ENTRYPOINT` khác nhau thế nào?**  
+   - `ENTRYPOINT` là lệnh chính, luôn chạy khi container start; khó bị override hơn.
+   - `CMD` là lệnh/đối số mặc định, có thể bị thay thế bằng lệnh truyền vào `docker run`.
+   - Có thể kết hợp: `ENTRYPOINT ["python"]` + `CMD ["app.py"]`.
+   - Nên dùng **exec form** (`["python", "app.py"]`) thay vì shell form để tín hiệu (SIGTERM) đến đúng process. Dockerfile này dùng `CMD ["python", "app.py"]`.
+
+### Exercise 2.2 — Build và chạy bản develop
+
+Build từ **gốc repo** (Dockerfile dùng đường dẫn tính từ root):
+
+```bash
+docker build -f 02-docker/develop/Dockerfile -t my-agent:develop .
+docker run -d --name agent-develop -p 8000:8000 my-agent:develop
+```
+
+Kết quả gọi container:
+
+```text
+GET http://127.0.0.1:8000/
+HTTP 200
+{"message":"Agent is running in a Docker container!"}
+```
+
+```text
+POST http://127.0.0.1:8000/ask?question=Hello
+HTTP 200
+{"answer":"Agent đang hoạt động tốt! (mock response) Hỏi thêm câu hỏi đi nhé."}
+```
+
+Gửi JSON thay vì query vẫn trả 422 — bản develop nhận `question` qua query:
+
+```text
+POST http://127.0.0.1:8000/ask
+Body: {"question": "Hello"}
+HTTP 422
+{"detail":[{"type":"missing","loc":["query","question"],"msg":"Field required","input":null}]}
+```
+
+Log container cho thấy uvicorn chạy trong container:
+
+```text
+INFO:     Started server process [1]
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+"GET / HTTP/1.1" 200 OK
+"POST /ask?question=Hello HTTP/1.1" 200 OK
+```
+
+Kích thước image (đo thực tế):
+
+```text
+my-agent:develop   1.67GB     # docker images
+docker image inspect .Size: 426,319,997 bytes ≈ 406.6 MB
+```
+
+### Exercise 2.3 — Multi-stage build
+
+Đọc `02-docker/production/Dockerfile`:
+
+- **Stage 1 — builder:** `python:3.11-slim`, cài `gcc` + `libpq-dev`, copy `requirements.txt` và chạy `pip install --no-cache-dir --user -r requirements.txt` → dependencies nằm trong `/root/.local`. Stage này có build tools nhưng **không được dùng để deploy**.
+- **Stage 2 — runtime:** `python:3.11-slim` sạch, tạo user `appuser`, copy `/root/.local` từ builder sang `/home/appuser/.local`, copy `main.py` + `utils/mock_llm.py`, chown, chuyển sang `USER appuser`, đặt `PATH`/`PYTHONPATH`, thêm `HEALTHCHECK` và `CMD` chạy uvicorn với 2 worker.
+
+**Vì sao image nhỏ hơn?** Stage runtime không mang theo compiler, apt packages, pip cache hay source trung gian; chỉ có Python runtime + site-packages + code cần chạy.
+
+Build và chạy:
+
+```bash
+docker build -f 02-docker/production/Dockerfile -t my-agent:advanced .
+docker run -d --name agent-advanced -p 8000:8000 my-agent:advanced
+```
+
+Kết quả:
+
+```text
+GET /health  → HTTP 200
+{"status":"ok","uptime_seconds":0.4,"version":"2.0.0","timestamp":"..."}
+
+GET /ready   → HTTP 200
+{"ready":true}
+
+POST /ask (JSON) → HTTP 200
+{"answer":"Agent đang hoạt động tốt! (mock response) Hỏi thêm câu hỏi đi nhé."}
+```
+
+Log cho thấy uvicorn chạy 2 worker và log JSON:
+
+```text
+INFO:     Started parent process [1]
+INFO:     Started server process [8]
+INFO:     Started server process [9]
+{"time":"...","level":"INFO","msg":"Starting agent..."}
+{"time":"...","level":"INFO","msg":"Agent ready"}
+```
+
+So sánh kích thước:
+
+| Image | `docker images` | `docker image inspect .Size` |
+|---|---:|---:|
+| `my-agent:develop` | 1.67 GB | 406.6 MB |
+| `my-agent:advanced` | 240 MB | 54.7 MB |
+| **Giảm** | **~85.6%** | **86.5%** |
+
+Công thức: `(size_develop - size_advanced) / size_develop × 100`.
+
+> Ghi chú: Docker Desktop hiển thị `docker images` lớn hơn `docker image inspect .Size` (có thể do manifest/attestation của BuildKit). Mình ghi cả hai số đo thực tế; tỉ lệ giảm nhất quán (~86%), và script chấm dùng `.Size` của inspect.
+
+### Exercise 2.4 — Docker Compose stack
+
+Các service trong `02-docker/production/docker-compose.yml`:
+
+| Service | Image / Build | Vai trò | Port ra host |
+|---|---|---|---|
+| `nginx` | `nginx:alpine` | Reverse proxy + load balancer, chặn/giới hạn request | `80`, `443` |
+| `agent` | build từ `02-docker/production/Dockerfile` (target `runtime`) | FastAPI agent, chạy 2 instance | Không publish trực tiếp |
+| `redis` | `redis:7-alpine` | Cache/session + rate limiting | Không publish |
+| `qdrant` | `qdrant/qdrant:v1.9.0` | Vector database cho RAG | Không publish |
+
+**Sơ đồ:**
+
+```text
+Client
+  │ :80/:443
+  ▼
+Nginx (reverse proxy + LB)
+  │ round-robin tới agent:8000
+  ├──────────────┐
+  ▼              ▼
+agent-1        agent-2
+  │              │
+  ├──────┬───────┘
+  ▼      ▼
+Redis   Qdrant
+(session/cache) (vector DB)
+```
+
+- Các service nói chuyện qua **DNS nội bộ Docker** trên network `internal`: `agent` gọi `redis:6379`, `qdrant:6333`; Nginx gọi `agent:8000`.
+- Chỉ Nginx publish port ra ngoài; agent/redis/qdrant không lộ trực tiếp.
+- `agent` có `depends_on` redis/qdrant với `condition: service_healthy`; `env_file: .env.local` (file này không có sẵn trong repo, phải `touch`).
+
+Khởi động:
+
+```bash
+cd 02-docker/production
+touch .env.local
+docker compose -p k5-day14-docker up -d --build --scale agent=2
+docker compose -p k5-day14-docker ps
+```
+
+Kết quả:
+
+```text
+NAME                       SERVICE   STATUS                   PORTS
+k5-day14-docker-agent-1    agent     Up (healthy)             8000/tcp
+k5-day14-docker-agent-2    agent     Up (healthy)             8000/tcp
+k5-day14-docker-nginx-1    nginx     Up                       0.0.0.0:80->80/tcp
+k5-day14-docker-qdrant-1   qdrant    Up (healthy)             6333-6334/tcp
+k5-day14-docker-redis-1    redis     Up (healthy)             6379/tcp
+```
+
+Test qua Nginx (cổng 80):
+
+```text
+GET http://localhost/health
+HTTP 200
+{"status":"ok","uptime_seconds":38.8,"version":"2.0.0","timestamp":"..."}
+
+GET http://localhost/ready
+HTTP 200
+{"ready":true}
+
+POST http://localhost/ask
+Body: {"question":"Explain microservices"}
+HTTP 200
+{"answer":"Agent đang hoạt động tốt! (mock response) Hỏi thêm câu hỏi đi nhé."}
+```
+
+Gửi thêm 10 request `/ask` qua Nginx, sau đó đếm log của từng agent:
+
+```text
+agent-1 served: 5/10
+agent-2 served: 5/10
+```
+
+→ Nginx phân tải round-robin đều giữa 2 instance. Log của agent có JSON request:
+
+```text
+{"time":"...","level":"INFO","msg":"{"event": "request", "q_len": 33}"}
+INFO:     172.22.0.6:39986 - "POST /ask HTTP/1.1" 200 OK
+```
+
+Dọn stack (đã chạy):
+
+```bash
+docker compose -p k5-day14-docker down -v
+```
+
+Sau khi dọn, không còn container/network/volume của bài.
+
+### Cách debug container
+
+```bash
+docker logs <container>                 # xem log app/uvicorn
+docker logs -f <container>              # theo dõi log realtime
+docker exec -it <container> sh          # vào shell trong container
+docker inspect <container>              # xem IP, env, mounts, health
+docker compose -p k5-day14-docker logs agent   # log tất cả agent instances
+```
+
+### Kết luận Part 2
+
+- `COPY requirements.txt` trước `COPY . .` giúp tận dụng Docker layer cache: chỉ cài lại dependencies khi `requirements.txt` thay đổi.
+- Multi-stage tách **builder** (có compiler/build tools) khỏi **runtime** (chỉ Python + site-packages + code), nên image advanced nhỏ hơn khoảng 86% và ít bề mặt tấn công hơn.
+- Docker Compose dựng cả stack bằng một lệnh; Nginx là cổng vào duy nhất, agent/redis/qdrant chỉ nói chuyện trong network nội bộ; scale 2 agent và quan sát Nginx chia đều 5/5 request.
 
 ---
 
@@ -166,5 +390,6 @@ Bản develop chứng minh agent chạy được trên laptop, nhưng chưa prod
 | Lần | Ngày | Hỏi gì | Nhận gì | Tự sửa và tự kiểm tra thế nào |
 |---:|---|---|---|---|
 | 1 | 25/11/2026 | Nhờ AI thực hiện CP1: đọc anti-pattern, chạy bản develop/production, viết Part 1 | AI chạy develop ở cổng 8010 và production ở 8000, thu output thật; gợi ý 12 anti-pattern và bảng so sánh 12 dòng | Đọc lại `develop/app.py` và `production/app.py` để đối chiếu số dòng; kiểm tra output `curl` khớp với file JSON ghi nhận; tự chạy lại lệnh khi cần |
+| 2 | 25/11/2026 | Nhờ AI thực hiện CP2: build/run 2 image Docker, đo size, dựng Compose stack và test Nginx | AI build `my-agent:develop` và `my-agent:advanced`, chạy container, đo size thật, dựng stack 2 agent + nginx + redis + qdrant, test `/health` `/ready` `/ask` và đếm phân tải 5/5 | Đọc lại 2 Dockerfile và `docker-compose.yml`; đối chiếu số MB với `docker images`; kiểm tra log từng agent; tự chạy lại `docker compose ps` trước khi dọn |
 
 > Ghi chú: sinh viên cần đọc lại toàn bộ câu trả lời, tự chạy lại ít nhất một lần và chỉnh AI log cho đúng với những gì mình thực sự kiểm tra trước khi nộp.
