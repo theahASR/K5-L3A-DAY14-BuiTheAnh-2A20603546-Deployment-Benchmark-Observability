@@ -363,7 +363,181 @@ docker compose -p k5-day14-docker logs agent   # log tất cả agent instances
 
 ## Part 4 — API Security
 
-<!-- Điền sau khi hoàn thành CP3: output curl 401/200/429 (che token), giải thích cost guard. -->
+### Exercise 4.1 — API Key authentication (develop)
+
+Đọc `04-api-gateway/develop/app.py`:
+
+- Key đọc từ `AGENT_API_KEY`, mặc định `demo-key-change-in-production`.
+- Header kiểm tra: `X-API-Key` qua `APIKeyHeader(name="X-API-Key", auto_error=False)`.
+- Thiếu key → **401**; sai key → **403** (bản develop); đúng key → **200**.
+- Rotate key: đổi biến `AGENT_API_KEY` trên môi trường và restart app; không sửa code.
+
+Chạy đúng như README K5:
+
+```bash
+cd 04-api-gateway/develop
+pip install -r requirements.txt
+AGENT_API_KEY=secret-key-123 python app.py
+```
+
+Kết quả thực tế:
+
+```text
+POST /ask   (không có X-API-Key)
+HTTP 401
+{"detail":"Missing API key. Include header: X-API-Key: <your-key>"}
+```
+
+```text
+POST /ask   (X-API-Key: secret-key-123)
+HTTP 200
+{"question":"Hello","answer":"Tôi là AI agent được deploy lên cloud. Câu hỏi của bạn đã được nhận."}
+```
+
+```text
+POST /ask   (X-API-Key: wrong-key)
+HTTP 403
+{"detail":"Invalid API key."}
+```
+
+### Exercise 4.2 — JWT authentication (production)
+
+Chạy:
+
+```bash
+cd ../production
+pip install -r requirements.txt
+python app.py
+```
+
+Lấy token đúng tài khoản K5:
+
+```bash
+curl -i -X POST http://localhost:8000/auth/token \
+  -H "Content-Type: application/json" \
+  -d '{"username":"student","password":"demo123"}'
+```
+
+Kết quả: HTTP 200, trả `access_token` (JWT HS256, hết hạn sau 60 phút). Token thật đã được che:
+
+```text
+{
+  "access_token": "eyJhbGciOiJIUzI1NiIsInR5...<đã cắt>",
+  "token_type": "bearer",
+  "expires_in_minutes": 60
+}
+```
+
+Gọi `/ask` không có token → **401**:
+
+```text
+POST /ask
+HTTP 401
+{"detail":"Authentication required. Include: Authorization: Bearer <token>"}
+```
+
+Gọi `/ask` với token → **200**:
+
+```text
+POST /ask
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5...<đã cắt>
+{"question":"Explain JWT"}
+
+HTTP 200
+{
+  "question": "Explain JWT",
+  "answer": "Agent đang hoạt động tốt! (mock response) Hỏi thêm câu hỏi đi nhé.",
+  "usage": {"requests_remaining": 9, "budget_remaining_usd": 0.000016}
+}
+```
+
+Đọc `auth.py`:
+- `create_token()` tạo JWT với `sub`, `role`, `iat`, `exp`; ký bằng `SECRET_KEY` + HS256.
+- `verify_token()` dùng `HTTPBearer(auto_error=False)`; thiếu token → 401; token hết hạn → 401; token sai → 403.
+- Demo users: `student/demo123` (user, 10 req/min) và `teacher/teach456` (admin, 100 req/min).
+
+### Exercise 4.3 — Rate limiting
+
+Đọc `rate_limiter.py`:
+- Algorithm: **sliding window counter** bằng `deque` timestamp trong memory.
+- `student`: **10 request/phút**; `teacher`: 100 request/phút.
+- Vượt giới hạn → `HTTPException(429)` kèm `Retry-After`, `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`.
+- Bản mẫu lưu trong memory nên reset khi restart và **không dùng chung giữa nhiều instance**; production thật nên thay bằng Redis.
+
+Chạy vòng lặp 20 request với token `student` (bash/WSL):
+
+```bash
+TOKEN="<token_lấy_từ_auth/token>"
+for i in $(seq 1 20); do
+  curl -s -o /dev/null -w "%{http_code}\n" -X POST http://localhost:8000/ask \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "{\"question\":\"Rate test $i\"}"
+done
+```
+
+```text
+Kết quả 20 request:
+200 × 10
+429 × 10
+
+Request thứ 11:
+HTTP 429
+retry-after: 59
+x-ratelimit-limit: 10
+x-ratelimit-remaining: 0
+body: {"detail":{"error":"Rate limit exceeded","limit":10,"window_seconds":60,"retry_after_seconds":59}}
+```
+
+### Tổng hợp output `curl -i` (token đã che)
+
+```text
+# 401 — không gửi token
+HTTP/1.1 401 Unauthorized
+www-authenticate: Bearer
+content-type: application/json
+{"detail":"Authentication required. Include: Authorization: Bearer <token>"}
+
+# 200 — token hợp lệ
+HTTP/1.1 200 OK
+content-type: application/json
+{"question":"Explain JWT","answer":"Agent đang hoạt động tốt! ...","usage":{...}}
+
+# 429 — vượt 10 request/phút
+HTTP/1.1 429 Too Many Requests
+retry-after: 59
+x-ratelimit-limit: 10
+x-ratelimit-remaining: 0
+content-type: application/json
+{"detail":{"error":"Rate limit exceeded","limit":10,"window_seconds":60,"retry_after_seconds":59}}
+```
+
+### Exercise 4.4 — Cost guard
+
+Đọc `cost_guard.py`:
+- `check_budget(user_id)` gọi **trước** LLM.
+- Per-user budget `$1/ngày`: vượt → **402 Payment Required**.
+- Global budget `$10/ngày`: vượt → **503 Service Unavailable**.
+- `record_usage(user_id, input_tokens, output_tokens)` gọi **sau** LLM, cộng token và tính cost.
+- Cảnh báo khi dùng 80% budget.
+- Bản mẫu lưu in-memory; production nên lưu Redis/DB, dùng phép tính atomic và reset theo ngày/tháng.
+
+Mình kiểm tra logic bằng unit test nhỏ (không sửa file mẫu):
+
+```text
+budget $1.00: OK (còn budget, không có 402)
+budget $0.000001: HTTP 402 - {'error': 'Daily budget exceeded', 'used_usd': 7.5e-05, 'budget_usd': 1e-06, 'resets_at': 'midnight UTC'}
+global cap $0.000001: HTTP 503 - Service temporarily unavailable due to budget limits. Try again tomorrow.
+```
+
+**Rate limit vs cost guard:** rate limit bảo vệ **tốc độ** (chống spam, bảo vệ hạ tầng); cost guard bảo vệ **tiền** (một request có thể rất đắt dù số lượng ít). Cần cả hai vì chúng chặn hai loại rủi ro khác nhau.
+
+### Kết luận Part 4
+
+- API key phù hợp MVP/internal API; JWT phù hợp khi cần danh tính, role và token hết hạn.
+- Rate limit phải lưu state dùng chung (Redis) khi scale; bản mẫu in-memory chỉ để học.
+- Cost guard nên kiểm tra trước khi gọi LLM và ghi nhận sau khi gọi; nếu chỉ ghi nhận mà không chặn, bill vẫn có thể vượt budget.
+- Không bao giờ trả stack trace hay log token/secret; các response trên đều trả JSON lỗi rõ ràng.
 
 ---
 
@@ -391,5 +565,6 @@ docker compose -p k5-day14-docker logs agent   # log tất cả agent instances
 |---:|---|---|---|---|
 | 1 | 25/11/2026 | Nhờ AI thực hiện CP1: đọc anti-pattern, chạy bản develop/production, viết Part 1 | AI chạy develop ở cổng 8010 và production ở 8000, thu output thật; gợi ý 12 anti-pattern và bảng so sánh 12 dòng | Đọc lại `develop/app.py` và `production/app.py` để đối chiếu số dòng; kiểm tra output `curl` khớp với file JSON ghi nhận; tự chạy lại lệnh khi cần |
 | 2 | 25/11/2026 | Nhờ AI thực hiện CP2: build/run 2 image Docker, đo size, dựng Compose stack và test Nginx | AI build `my-agent:develop` và `my-agent:advanced`, chạy container, đo size thật, dựng stack 2 agent + nginx + redis + qdrant, test `/health` `/ready` `/ask` và đếm phân tải 5/5 | Đọc lại 2 Dockerfile và `docker-compose.yml`; đối chiếu số MB với `docker images`; kiểm tra log từng agent; tự chạy lại `docker compose ps` trước khi dọn |
+| 3 | 25/11/2026 | Nhờ AI thực hiện CP3: chạy API key, JWT, rate limit và cost guard | AI chạy develop với `AGENT_API_KEY=secret-key-123`, lấy token `student/demo123` từ `/auth/token`, gửi 20 request `/ask` (10×200, 10×429), và test logic `CostGuard` cho 402/503 | Đọc lại `app.py`, `auth.py`, `rate_limiter.py`, `cost_guard.py`; đối chiếu status/header; token đã được che trước khi ghi vào bài |
 
 > Ghi chú: sinh viên cần đọc lại toàn bộ câu trả lời, tự chạy lại ít nhất một lần và chỉnh AI log cho đúng với những gì mình thực sự kiểm tra trước khi nộp.
