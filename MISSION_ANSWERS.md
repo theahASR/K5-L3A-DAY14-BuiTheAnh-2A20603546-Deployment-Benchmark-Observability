@@ -357,7 +357,55 @@ docker compose -p k5-day14-docker logs agent   # log tất cả agent instances
 
 ## Part 3 — Cloud Deployment
 
-<!-- Điền sau khi hoàn thành CP6: URL public, so sánh railway.toml/render.yaml, mô tả pipeline Cloud Run. -->
+### Nền tảng chính — Railway
+
+- **Public URL:** https://agent-production-deb67b49.up.railway.app
+- **Project:** `k5-day14-agent`
+- **Service:** `agent` (build từ `06-lab-complete/Dockerfile`)
+- **Redis:** service `Redis` của Railway, agent dùng `REDIS_URL=${{Redis.REDIS_URL}}`
+- **Config:** `railway.toml` với builder `DOCKERFILE` và healthcheck `/health`
+
+Kết quả test 4 lệnh CP6:
+
+```text
+GET  /health  → HTTP 200  {"status":"ok"}
+GET  /ready   → HTTP 200  {"status":"ready"}
+POST /ask     → HTTP 401  {"detail":"Invalid or missing API key"}
+POST /ask     → HTTP 200  {"question":"Hello","answer":"..."}
+```
+
+`/ready` trả 200 chứng minh agent kết nối được Redis trên cloud. API key được đặt bằng biến môi trường trên Railway, không nằm trong code.
+
+### So sánh `railway.toml` và `render.yaml`
+
+| Điểm | `railway.toml` | `render.yaml` |
+|---|---|---|
+| Định dạng | TOML | YAML (Blueprint) |
+| Khai báo build | `[build] builder = "DOCKERFILE"` | `type: web`, `runtime: docker` |
+| Health check | `healthcheckPath = "/health"` | `healthCheckPath: /health` |
+| Nguồn deploy | `railway up` upload từ máy / CLI | Render đọc file trong GitHub repo (Blueprint) |
+| Secret | Set qua `railway variable set` / Dashboard | `generateValue: true` hoặc `sync: false` |
+| Redis | Tạo service Redis riêng, tham chiếu `${{Redis.REDIS_URL}}` | Khai báo service `type: redis` trong cùng file |
+| Restart | `restartPolicyType`, `restartPolicyMaxRetries` | Render tự quản lý theo service |
+| Phù hợp | Deploy nhanh từ CLI, ít file | Infrastructure as Code, tự deploy khi push GitHub |
+
+Điểm chung: cả hai đều dùng Dockerfile, cùng healthcheck `/health`, và không ghi secret trực tiếp vào file cấu hình.
+
+### Exercise 3.3 — Cloud Run CI/CD pipeline
+
+Đọc `cloudbuild.yaml` và `service.yaml`:
+
+1. Cloud Build được trigger khi push code; step đầu chạy `pip install` + `pytest`.
+2. Build Docker image với tag `$COMMIT_SHA` và `latest`, dùng layer cache từ image trước.
+3. Push image lên Container Registry (`gcr.io/$PROJECT_ID/ai-agent`).
+4. Deploy lên Cloud Run với image mới, region `asia-southeast1`, min/max instances, memory/CPU, timeout, env và secret từ Secret Manager.
+5. `service.yaml` mô tả Knative Service: container port 8000, resource, env, liveness `/health`, startup `/ready`, autoscaling min 1/max 10, concurrency 80.
+
+### Ảnh deploy
+
+- `screenshots/dashboard.png` — Railway project/dashboard
+- `screenshots/running.png` — service running/deployment logs
+- `screenshots/test.png` — kết quả test 4 lệnh
 
 ---
 
@@ -806,5 +854,6 @@ python check_production_ready.py
 | 3 | 25/11/2026 | Nhờ AI thực hiện CP3: chạy API key, JWT, rate limit và cost guard | AI chạy develop với `AGENT_API_KEY=secret-key-123`, lấy token `student/demo123` từ `/auth/token`, gửi 20 request `/ask` (10×200, 10×429), và test logic `CostGuard` cho 402/503 | Đọc lại `app.py`, `auth.py`, `rate_limiter.py`, `cost_guard.py`; đối chiếu status/header; token đã được che trước khi ghi vào bài |
 | 4 | 25/11/2026 | Nhờ AI thực hiện CP4: health/ready, graceful shutdown, stack 3 agent + Redis + Nginx, test stateless | AI test `/health` `/ready` `/ask`, gửi SIGTERM khi có request in-flight (200, exit 0), dựng stack 3 agent và chạy `test_stateless.py` (3 instance, history 10 messages) | Đọc lại `app.py`, `lifespan`, middleware, `test_stateless.py`; đối chiếu log uvicorn; phát hiện event loop bị block bởi `time.sleep()` và custom SIGTERM handler; đã dọn stack |
 | 5 | 25/11/2026 | Nhờ AI làm CP5: sửa toàn bộ TODO trong `06-lab-complete/` để đạt PASS 12/12 | AI implement config/redis/auth/rate limiter/cost guard/main, Dockerfile multi-stage, compose, `.dockerignore`, `.env.example`, `railway.toml`, `render.yaml`; chạy static → runtime → full check | Đọc lại từng file, đối chiếu 12 tiêu chí trong `06-lab-complete/README.md`; tự chạy `python check_production_ready.py` trong WSL; xác nhận 43/43 checks, image 69 MB, `docker stop` 1.2s |
+| 6 | 25/11/2026 | Nhờ AI deploy CP6 lên Railway | AI cài Railway CLI, đăng nhập, tạo project `k5-day14-agent`, thêm service `agent` + Redis, set env, `railway up`, tạo domain, test 4 lệnh (200/200/401/200) | Đọc log deployment, kiểm tra `/ready` 200 (Redis kết nối đúng), test lại public URL; API key lưu ngoài repo, không ghi vào bài |
 
 > Ghi chú: sinh viên cần đọc lại toàn bộ câu trả lời, tự chạy lại ít nhất một lần và chỉnh AI log cho đúng với những gì mình thực sự kiểm tra trước khi nộp.
