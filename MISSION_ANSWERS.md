@@ -709,13 +709,91 @@ docker compose -p k5-day14-scaling down -v
 
 ## Part 6 — Final Project
 
+### Những gì đã sửa trong `06-lab-complete/`
+
+| Tiêu chí | File | Cách làm |
+|---|---|---|
+| 1. Dockerfile multi-stage, < 500 MB | `Dockerfile` | Builder cài deps bằng `pip --user`; runtime `python:3.11-slim`, non-root `appuser`, `HEALTHCHECK`, `exec uvicorn` với `${PORT}` |
+| 2. Compose agent + redis | `docker-compose.yml` | agent build từ Dockerfile + redis:7-alpine; `REDIS_URL=redis://redis:6379/0`, `depends_on` healthcheck |
+| 3. `.dockerignore` | `.dockerignore` | Loại `.env`, `__pycache__`, `venv`, `.git`, `benchmark-observability/` |
+| 4. `/health` | `app/main.py` | Luôn 200 khi process còn chạy, không phụ thuộc Redis |
+| 5. `/ready` | `app/main.py`, `app/redis_client.py` | Ping Redis; lỗi kết nối → 503 |
+| 6. API key | `app/auth.py` | `X-API-Key` qua `APIKeyHeader(auto_error=False)`; thiếu/sai → 401 |
+| 7. Rate limit | `app/rate_limiter.py` | Sliding window 60s bằng Redis sorted set; vượt → 429 + `Retry-After` |
+| 8. Cost guard | `app/cost_guard.py` | `check_budget()` trước LLM → 402; `record_cost()` sau LLM cộng Redis |
+| 9. Config từ env | `app/config.py`, `.env.example` | `os.getenv` cho PORT, ENVIRONMENT, AGENT_API_KEY, REDIS_URL, RATE_LIMIT_PER_MINUTE, DAILY_BUDGET_USD |
+| 10. JSON logging | `app/main.py` | `json.dumps` từng dòng, logger riêng `propagate=False` |
+| 11. Graceful shutdown | `app/main.py`, `Dockerfile` | `lifespan` đóng Redis; CMD dùng `exec` để uvicorn là PID 1 |
+| 12. Deploy config | `railway.toml`, `render.yaml` | Railway builder DOCKERFILE + healthcheck `/health`; Render web + healthCheckPath + secret `generateValue`/`sync: false` |
+
 ### Kết quả `check_production_ready.py`
 
-<!-- Dán phần "📋 Checklist Deliverable" của output khi đạt PASS 12/12. -->
+Chạy trong WSL2 Ubuntu (Python 3.14, Docker 28.5.1):
+
+```bash
+cd 06-lab-complete
+python check_production_ready.py
+```
 
 ```text
-(chưa chạy)
+✅ 1. Dockerfile (multi-stage, < 500 MB)
+     ✅ Docker: build image thành công — 79s
+     ✅ Docker: image < 500 MB — 69 MB
+     ✅ Docker: container chạy được, GET /health → 200
+
+✅ 2. docker-compose.yml (agent + redis)
+✅ 3. .dockerignore
+
+✅ 4. Health check endpoint (GET /health)
+✅ 5. Readiness endpoint (GET /ready)
+     ✅ Khi chạy: Redis mất kết nối → /ready 503 (còn /health vẫn 200)
+
+✅ 6. API Key authentication
+✅ 7. Rate limiting
+     ✅ Khi chạy: vượt giới hạn → 429 — 429 sau 5 request thành công
+     ✅ Khi chạy: state nằm trong Redis — restart agent vẫn bị 429
+
+✅ 8. Cost guard
+     ✅ Khi chạy: hết budget → 402
+
+✅ 9. Config từ environment variables
+✅ 10. Structured logging
+     ✅ Khi chạy: mọi dòng log của app là JSON hợp lệ — 7 dòng JSON
+
+✅ 11. Graceful shutdown
+     ✅ Khi chạy: SIGTERM lúc đang có request → request vẫn 200, process tự thoát — exit code 0
+     ✅ Docker: `docker stop` tắt êm (exit code 0, < 10s) — exit code 0, 1.2s
+
+✅ 12. Public URL ready (Railway / Render config)
+
+================================================================
+  📋 Checklist Deliverable
+     ✅ Dockerfile (multi-stage, < 500 MB)
+     ✅ docker-compose.yml (agent + redis)
+     ✅ .dockerignore
+     ✅ Health check endpoint (GET /health)
+     ✅ Readiness endpoint (GET /ready)
+     ✅ API Key authentication
+     ✅ Rate limiting
+     ✅ Cost guard
+     ✅ Config từ environment variables
+     ✅ Structured logging
+     ✅ Graceful shutdown
+     ✅ Public URL ready (Railway / Render config)
+----------------------------------------------------------------
+  Result: 12/12 tiêu chí đạt · 43/43 checks passed
+  🎉 PASS 12/12 — PRODUCTION READY! Deploy nào!
+================================================================
 ```
+
+### Ghi chú kỹ thuật
+
+- Image cuối chỉ **69 MB** nhờ multi-stage + `python:3.11-slim`, không mang compiler/cache.
+- `docker stop` mất **1.2s**, exit code 0 → uvicorn nhận SIGTERM đúng (PID 1 nhờ `exec`).
+- Rate limit dùng Redis sorted set nên restart agent vẫn còn 429; không dùng dict trong RAM.
+- `/health` không gọi Redis; `/ready` ping Redis và trả 503 khi mất kết nối.
+- Log app là JSON thuần; log của uvicorn không tính.
+- Khi chạy local trong WSL, venv dùng pydantic 2.14.4 (Python 3.14 không có wheel cho pin 2.9.0); Docker image dùng đúng `requirements.txt` với Python 3.11 và vẫn PASS.
 
 ---
 
@@ -727,5 +805,6 @@ docker compose -p k5-day14-scaling down -v
 | 2 | 25/11/2026 | Nhờ AI thực hiện CP2: build/run 2 image Docker, đo size, dựng Compose stack và test Nginx | AI build `my-agent:develop` và `my-agent:advanced`, chạy container, đo size thật, dựng stack 2 agent + nginx + redis + qdrant, test `/health` `/ready` `/ask` và đếm phân tải 5/5 | Đọc lại 2 Dockerfile và `docker-compose.yml`; đối chiếu số MB với `docker images`; kiểm tra log từng agent; tự chạy lại `docker compose ps` trước khi dọn |
 | 3 | 25/11/2026 | Nhờ AI thực hiện CP3: chạy API key, JWT, rate limit và cost guard | AI chạy develop với `AGENT_API_KEY=secret-key-123`, lấy token `student/demo123` từ `/auth/token`, gửi 20 request `/ask` (10×200, 10×429), và test logic `CostGuard` cho 402/503 | Đọc lại `app.py`, `auth.py`, `rate_limiter.py`, `cost_guard.py`; đối chiếu status/header; token đã được che trước khi ghi vào bài |
 | 4 | 25/11/2026 | Nhờ AI thực hiện CP4: health/ready, graceful shutdown, stack 3 agent + Redis + Nginx, test stateless | AI test `/health` `/ready` `/ask`, gửi SIGTERM khi có request in-flight (200, exit 0), dựng stack 3 agent và chạy `test_stateless.py` (3 instance, history 10 messages) | Đọc lại `app.py`, `lifespan`, middleware, `test_stateless.py`; đối chiếu log uvicorn; phát hiện event loop bị block bởi `time.sleep()` và custom SIGTERM handler; đã dọn stack |
+| 5 | 25/11/2026 | Nhờ AI làm CP5: sửa toàn bộ TODO trong `06-lab-complete/` để đạt PASS 12/12 | AI implement config/redis/auth/rate limiter/cost guard/main, Dockerfile multi-stage, compose, `.dockerignore`, `.env.example`, `railway.toml`, `render.yaml`; chạy static → runtime → full check | Đọc lại từng file, đối chiếu 12 tiêu chí trong `06-lab-complete/README.md`; tự chạy `python check_production_ready.py` trong WSL; xác nhận 43/43 checks, image 69 MB, `docker stop` 1.2s |
 
 > Ghi chú: sinh viên cần đọc lại toàn bộ câu trả lời, tự chạy lại ít nhất một lần và chỉnh AI log cho đúng với những gì mình thực sự kiểm tra trước khi nộp.
