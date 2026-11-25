@@ -5,7 +5,7 @@
 **Họ tên:** Bùi Thế Anh  
 **MSSV:** 2A20603546  
 **Ngày chạy:** 25/11/2026  
-**Môi trường:** Windows 11 + WSL2 Ubuntu, Python 3.14, Docker Desktop 28.5.1; agent chạy local (không Docker) cho Part 7 Bước 1
+**Môi trường:** Windows 11 + WSL2 Ubuntu, Python 3.14, Docker Desktop 28.5.1; Part 7 Bước 1 chạy agent local (không Docker), Bước 2 chạy stack Docker Compose (Prometheus/Grafana/Jaeger/Locust)
 
 ---
 
@@ -76,36 +76,49 @@
 
 ### 4.1 Screenshot
 
-- [ ] Dashboard Grafana khi đang có tải (thấy rõ Golden Signals)
-- [ ] Một trace chậm trong Jaeger (thấy span nào chiếm thời gian)
-- [ ] Một trace lỗi trong Jaeger (có event `exception`)
-- [ ] Trang Alerts của Prometheus với ít nhất 1 alert đang **firing**
+- [x] Dashboard Grafana khi đang có tải — `screenshots/grafana-dashboard.png` (52.7 req/s, p95 1.60s)
+- [x] Một trace chậm trong Jaeger — `screenshots/jaeger-slow-trace.png` (trace `ad331b8b...`, chat span 1665ms)
+- [x] Một trace lỗi trong Jaeger — `screenshots/jaeger-error-trace.png` (HTTP 503, span `chat` có error + exception)
+- [x] Trang Alerts của Prometheus với 2 alert đang **firing** — `screenshots/prometheus-alert-firing.png`
 
 ### 4.2 Thí nghiệm "phá hệ thống"
 
 | # | Thay đổi | Alert nào firing | Thời gian từ lúc đổi → firing | Panel nào phản ánh rõ nhất |
 |---|---|---|---|---|
-| A | `MOCK_ERROR_RATE=0.2` | | | |
-| B | `MOCK_SLOW_RATE=0.3` | | | |
-| C | `LLM_MODEL=mock-llm-large` | | | |
-| D | `docker pause` 1 instance | | | |
-| E | `AGENT_VERSION=v1` | | | |
+| A | `MOCK_ERROR_RATE=0.2` (chạy cùng B) | `AgentHighErrorRate` | ~1m49s (109s; pending ~49s + for 1m) | Error rate (%) |
+| B | `MOCK_SLOW_RATE=0.3` (chạy cùng A) | `AgentHighLatencyP95` | ~2m54s (174s; pending ~54s + for 2m) | Latency p95 / p99 |
+| C | `LLM_MODEL=mock-llm-large` | Không chạy trong buổi lab | — | Cost burn rate (dự kiến) |
+| D | `docker pause` 1 instance | Không chạy trong buổi lab | — | Instances up (dự kiến) |
+| E | `AGENT_VERSION=v1` | **Không có alert** | — | Version/retrieval hit ratio; chất lượng không làm metric hạ tầng đỏ |
 
 **Thí nghiệm E không làm alert nào firing. Bạn sẽ phát hiện loại sự cố này trong production bằng cách nào?**
 
-...
+Dùng **eval chất lượng** trên golden dataset và quality gate trong CI: v1 chỉ đạt 4.3% (1/23) so với v2 91.3% (21/23), chênh lệch rất lớn dù error rate/latency hạ tầng vẫn xanh. Ngoài ra có thể dùng synthetic check theo bộ câu hỏi cố định, canary + so sánh accuracy giữa hai phiên bản, user feedback, hoặc LLM-as-judge. Đây là lý do phải benchmark **chất lượng** tách khỏi benchmark **hiệu năng**.
+
+**Thí nghiệm A+B (đã chạy):** đổi `.env` lúc `16:22:03Z`, chạy Locust 30 user trong 3 phút. Prometheus ghi nhận:
+- `AgentHighErrorRate` active lúc `16:22:52Z`, firing sau `for: 1m` → ~1m49s từ lúc đổi.
+- `AgentHighLatencyP95` active lúc `16:22:57Z`, firing sau `for: 2m` → ~2m54s từ lúc đổi.
+- Ảnh `prometheus-alert-firing.png` chụp cả 2 alert ở trạng thái **FIRING**.
 
 ### 4.3 Debug bằng trace
 
-Chọn 1 trace chậm nhất bạn tìm được:
+Chọn 1 trace chậm nhất tìm được:
 
-- `trace_id`: ...
-- Tổng thời gian: ... ms
-- Span chiếm nhiều thời gian nhất: ... (... ms, ...%)
-- Dòng log tương ứng (grep theo `trace_id`):
+- `trace_id`: `ad331b8b340ab69947158d5a07066be7`
+- Tổng thời gian: **1968.9 ms**
+- Span chiếm nhiều thời gian nhất: **`chat mock-llm-small` — 1665.2 ms (~84.6% tổng trace)**
+- Các span còn lại: `agent.run` 1753.7 ms, `agent.retrieve_context` 88.3 ms, `POST /ask` 1968.9 ms.
+
+Dòng log tương ứng (grep theo `trace_id`):
 
 ```json
+{"ts": "2026-11-25T16:15:09.132437+00:00", "level": "INFO", "service": "observable-agent", "instance": "33e32e24cce0", "event": "llm_call", "trace_id": "ad331b8b340ab69947158d5a07066be7", "span_id": "c2d36d32daa62594", "request_id": "098b06729180", "model": "mock-llm-small", "agent_version": "v2", "input_tokens": 72, "output_tokens": 40, "cost_usd": 3.5e-05, "llm_ms": 1663.9}
+```
 
+**Trace lỗi:** `91931bdbc2b3a91e792e71612a4b8a85` — tổng 235.3 ms, span `chat mock-llm-small` 96.5 ms có `status.code=ERROR` và event `exception`:
+
+```json
+{"ts": "2026-11-25T16:15:12.096741+00:00", "level": "INFO", "service": "observable-agent", "instance": "216c8a44e8ea", "event": "llm_error", "trace_id": "91931bdbc2b3a91e792e71612a4b8a85", "span_id": "72fd8e33c9caa85f", "request_id": "089a6c3f51e5", "error": "Upstream LLM error: 503 Service Unavailable (mock)"}
 ```
 
 ---
@@ -114,21 +127,22 @@ Chọn 1 trace chậm nhất bạn tìm được:
 
 | Số instance | RPS | p50 (ms) | p95 (ms) | p99 (ms) | Failures |
 |---|---|---|---|---|---|
-| 1 | | | | | |
-| 3 | | | | | |
+| 1 | 45.04 | 250 | 2500 | 3700 | 57 (1.07%) |
+| 3 | 52.17 | 220 | 1700 | 2200 | 75 (1.22%) |
 
-**Giải thích kết quả:** Scale có cải thiện p95 không? Nút thắt nằm ở đâu?
-
-...
+**Giải thích kết quả:** Scale từ 1 → 3 instance cải thiện rõ p95 (**2500 → 1700 ms, giảm ~32%**), p99 (**3700 → 2200 ms, giảm ~41%**) và p50 (250 → 220 ms); RPS tăng từ 45,0 → 52,2 req/s (~16%), không tuyến tính. Nút thắt chính nằm ở **LLM upstream**: trace chậm nhất cho thấy `chat mock-llm-small` chiếm 1665/1969 ms (~85%); scale thêm agent không làm LLM nhanh hơn. Ngoài ra mock LLM cố tình trả ~1% lỗi 503 nên failures vẫn còn. Muốn cải thiện tiếp cần cache/async, tăng capacity hoặc giảm độ dài prompt/model.
 
 ---
 
 ## 6. Kết luận
 
-- 3 điều bạn học được về benchmark & observability:
-  1. ...
-  2. ...
-  3. ...
-- Nếu đưa agent này lên production thật, bạn sẽ thêm metric / alert nào nữa?
-
-...
+- 3 điều học được về benchmark & observability:
+  1. **Không nhìn average**: p95/p99 mới phản ánh tail latency; `MOCK_SLOW_RATE=0.03` làm p99 nhảy lên 1.685 ms trong khi average chỉ 229,5 ms. SLO phải đặt theo percentile.
+  2. **Hiệu năng và chất lượng là hai bài toán khác nhau**: v2 có p95/latency/error rate đẹp nhưng nếu không eval thì không biết accuracy chỉ 91,3%; quality gate + golden dataset bắt được regression mà dashboard hạ tầng không thấy.
+  3. **Observability phải có cả 3 trụ cột**: metrics chỉ ra “có vấn đề”, trace chỉ ra “chậm ở span nào” (`chat` 1665 ms), log JSON có `trace_id` nối trace với sự kiện cụ thể; alert cần `for` để tránh báo động giả.
+- Nếu đưa agent này lên production thật, mình sẽ thêm:
+  - Alert theo **error rate / p95 của Nginx** (bao gồm 502/504 từ LB) vì metric của agent không thấy lỗi xảy ra ở tầng proxy.
+  - Alert **cost/token theo user** và **retrieval hit ratio**; quality gate eval trong CI trước mỗi deploy.
+  - **Synthetic check** định kỳ bằng bộ câu hỏi golden; **canary** so sánh accuracy/latency giữa hai phiên bản.
+  - Metric **queue depth / in-flight requests** và **LLM provider error rate** để phân biệt quá tải agent với lỗi upstream.
+  - Alert **error budget burn rate** theo SLO thay vì chỉ ngưỡng tức thời.
