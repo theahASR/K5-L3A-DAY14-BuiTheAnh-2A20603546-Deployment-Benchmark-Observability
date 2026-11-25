@@ -543,7 +543,167 @@ global cap $0.000001: HTTP 503 - Service temporarily unavailable due to budget l
 
 ## Part 5 — Scaling & Reliability
 
-<!-- Điền sau khi hoàn thành CP4: health/ready, graceful shutdown, test_stateless, giải thích stateless. -->
+### Exercise 5.1 — Health checks
+
+Chạy `05-scaling-reliability/develop`:
+
+```bash
+cd 05-scaling-reliability/develop
+pip install -r requirements.txt
+python app.py
+```
+
+Kết quả thực tế:
+
+```text
+GET /health
+HTTP 200
+{
+  "status": "ok",
+  "uptime_seconds": 2.0,
+  "version": "1.0.0",
+  "environment": "development",
+  "timestamp": "...",
+  "checks": {"memory": {"status": "ok", "note": "psutil not installed"}}
+}
+```
+
+```text
+GET /ready
+HTTP 200
+{"ready": true, "in_flight_requests": 1}
+```
+
+```text
+POST /ask?question=hello
+HTTP 200
+{"answer": "Agent đang hoạt động tốt! (mock response) Hỏi thêm câu hỏi đi nhé."}
+```
+
+- `/health` là **liveness**: process còn sống thì trả 200; platform dùng để quyết định restart container.
+- `/ready` là **readiness**: chỉ trả 200 khi đã sẵn sàng nhận traffic; đang startup/shutdown hoặc thiếu dependency thì trả **503** để load balancer ngừng route traffic (không restart).
+- Trong Part 6: `/health` phải **luôn 200 kể cả khi Redis chết**; `/ready` phải **503 khi Redis không kết nối được**.
+
+### Exercise 5.2 — Graceful shutdown
+
+Cơ chế trong `05-scaling-reliability/develop/app.py`:
+- `lifespan` startup đặt `_is_ready = True`; shutdown đặt `_is_ready = False`.
+- Middleware `track_requests` tăng/giảm `_in_flight_requests`.
+- Khi shutdown, app chờ các request in-flight hoàn thành (tối đa 30 giây) rồi mới thoát.
+- `uvicorn.run(..., timeout_graceful_shutdown=30)`.
+
+Test gửi SIGTERM khi đang có 1 request `/ask` (mock delay 3 giây):
+
+```text
+server pid=8948
+sending SIGTERM while one request is in flight...
+request_status=200
+request_body={"answer":"Tôi là AI agent được deploy lên cloud. Câu hỏi của bạn đã được nhận."}
+server_exit_code=0
+
+--- server log ---
+INFO:     Shutting down
+INFO:     127.0.0.1:53500 - "POST /ask?question=hello HTTP/1.1" 200 OK
+INFO:     Waiting for application shutdown.
+INFO:     🔄 Graceful shutdown initiated...
+INFO:     ✅ Shutdown complete
+INFO:     Application shutdown complete.
+INFO:     Finished server process [8948]
+```
+
+→ Request đang chạy vẫn trả **200**, process tự thoát với **exit code 0**, không bị cắt ngang.
+
+**Hai phát hiện thực tế quan trọng:**
+
+1. **Event loop bị block:** `/ask` là `async def` nhưng gọi mock `ask()` có `time.sleep(3)` trực tiếp. Khi gửi 2 request song song, chỉ request đầu được xử lý; request thứ hai không chạy song song. Trong production nên dùng async LLM client (httpx/AsyncOpenAI), hoặc để endpoint là `def` (FastAPI chạy trong threadpool), hoặc `run_in_threadpool`.
+2. **Custom SIGTERM handler:** app tự gọi `signal.signal(SIGTERM, handle_sigterm)` chỉ để log. Khi chạy bằng `uvicorn app:app`, handler này thay handler của uvicorn và server **không thoát** sau SIGTERM. Khi chạy đúng `python app.py`, uvicorn cài handler của nó và shutdown hoạt động. Bài học cho Part 6: nếu tự đăng ký handler, phải gọi lại handler cũ của uvicorn; tốt nhất để uvicorn tự xử lý.
+
+### Exercise 5.3 — Stateless design
+
+- **Anti-pattern:** lưu `conversation_history` trong dict/RAM. Mỗi instance có memory riêng:
+  ```text
+  Instance 1: user A request 1 → lưu session trong RAM ✅
+  Instance 2: user A request 2 → không thấy session ❌
+  ```
+- **Correct:** lưu session/history trong Redis với TTL:
+  ```python
+  _redis.setex(f"session:{session_id}", ttl_seconds, json.dumps(data))
+  data = _redis.get(f"session:{session_id}")
+  ```
+- Trong `05-scaling-reliability/production/app.py`:
+  - `save_session()` / `load_session()` dùng Redis, TTL 1 giờ.
+  - `append_to_history()` giữ tối đa 20 messages.
+  - `served_by` cho biết instance nào phục vụ request.
+  - Nếu Redis không kết nối được, app fallback sang in-memory — chỉ để demo; production thật nên fail-fast/alert thay vì âm thầm mất state.
+
+### Exercise 5.4 — Load balancing
+
+```bash
+cd 05-scaling-reliability/production
+touch .env.local
+docker compose -p k5-day14-scaling up -d --build --scale agent=3
+docker compose -p k5-day14-scaling ps
+```
+
+Kết quả:
+
+```text
+NAME                       STATUS                   PORTS
+k5-day14-scaling-agent-1   Up (healthy)             8000/tcp
+k5-day14-scaling-agent-2   Up (healthy)             8000/tcp
+k5-day14-scaling-agent-3   Up (healthy)             8000/tcp
+k5-day14-scaling-nginx-1   Up                       0.0.0.0:8080->80/tcp
+k5-day14-scaling-redis-1   Up (healthy)             6379/tcp
+```
+
+- 3 agent instance không publish port trực tiếp; chỉ Nginx mở **8080**.
+- Nginx dùng Docker DNS `agent:8000` để round-robin; request được chia cho các instance.
+
+### Exercise 5.5 — Test stateless
+
+Chạy (trong WSL để tránh lỗi encoding tiếng Việt trên Windows):
+
+```bash
+python test_stateless.py
+```
+
+Kết quả thực tế:
+
+```text
+Session ID: ccd4fc18-f12b-4bbf-b302-dce50f2d9ee1
+
+Request 1: [instance-43a97f]
+Request 2: [instance-71a145]
+Request 3: [instance-958d08]
+Request 4: [instance-43a97f]
+Request 5: [instance-71a145]
+
+Total requests: 5
+Instances used: {'instance-43a97f', 'instance-71a145', 'instance-958d08'}
+✅ All requests served despite different instances!
+
+--- Conversation History ---
+Total messages: 10
+✅ Session history preserved across all instances via Redis!
+```
+
+- 5 request đi qua **3 instance khác nhau**, nhưng history vẫn đủ **10 messages** (5 user + 5 assistant).
+- Log agent cho thấy `Storage: Redis ✅`, `POST /chat 200`, `GET /chat/.../history 200`.
+- Script **không kill instance nào** (đúng README K5); nó chứng minh state dùng chung qua Redis.
+
+Dọn stack:
+
+```bash
+docker compose -p k5-day14-scaling down -v
+```
+
+### Kết luận Part 5
+
+- Liveness (`/health`) và readiness (`/ready`) phục vụ hai mục đích khác nhau: restart process vs ngừng route traffic.
+- Graceful shutdown cần uvicorn nhận SIGTERM và chờ request in-flight; đừng tự chặn handler của uvicorn.
+- State trong RAM không thể scale ngang; Redis là nơi dùng chung cho session/history.
+- `test_stateless.py` chứng minh: 3 instance khác nhau vẫn phục vụ cùng một session, history không mất.
+- Khi scale, cần chú ý cả điểm nghẽn bên trong app (event loop bị block bởi sync call) chứ không chỉ số instance.
 
 ---
 
@@ -566,5 +726,6 @@ global cap $0.000001: HTTP 503 - Service temporarily unavailable due to budget l
 | 1 | 25/11/2026 | Nhờ AI thực hiện CP1: đọc anti-pattern, chạy bản develop/production, viết Part 1 | AI chạy develop ở cổng 8010 và production ở 8000, thu output thật; gợi ý 12 anti-pattern và bảng so sánh 12 dòng | Đọc lại `develop/app.py` và `production/app.py` để đối chiếu số dòng; kiểm tra output `curl` khớp với file JSON ghi nhận; tự chạy lại lệnh khi cần |
 | 2 | 25/11/2026 | Nhờ AI thực hiện CP2: build/run 2 image Docker, đo size, dựng Compose stack và test Nginx | AI build `my-agent:develop` và `my-agent:advanced`, chạy container, đo size thật, dựng stack 2 agent + nginx + redis + qdrant, test `/health` `/ready` `/ask` và đếm phân tải 5/5 | Đọc lại 2 Dockerfile và `docker-compose.yml`; đối chiếu số MB với `docker images`; kiểm tra log từng agent; tự chạy lại `docker compose ps` trước khi dọn |
 | 3 | 25/11/2026 | Nhờ AI thực hiện CP3: chạy API key, JWT, rate limit và cost guard | AI chạy develop với `AGENT_API_KEY=secret-key-123`, lấy token `student/demo123` từ `/auth/token`, gửi 20 request `/ask` (10×200, 10×429), và test logic `CostGuard` cho 402/503 | Đọc lại `app.py`, `auth.py`, `rate_limiter.py`, `cost_guard.py`; đối chiếu status/header; token đã được che trước khi ghi vào bài |
+| 4 | 25/11/2026 | Nhờ AI thực hiện CP4: health/ready, graceful shutdown, stack 3 agent + Redis + Nginx, test stateless | AI test `/health` `/ready` `/ask`, gửi SIGTERM khi có request in-flight (200, exit 0), dựng stack 3 agent và chạy `test_stateless.py` (3 instance, history 10 messages) | Đọc lại `app.py`, `lifespan`, middleware, `test_stateless.py`; đối chiếu log uvicorn; phát hiện event loop bị block bởi `time.sleep()` và custom SIGTERM handler; đã dọn stack |
 
 > Ghi chú: sinh viên cần đọc lại toàn bộ câu trả lời, tự chạy lại ít nhất một lần và chỉnh AI log cho đúng với những gì mình thực sự kiểm tra trước khi nộp.
